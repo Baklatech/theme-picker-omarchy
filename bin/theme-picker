@@ -1,0 +1,595 @@
+#!/usr/bin/python3
+"""Backend of the gnome627.theme-picker shell plugin (the Omarchy theme catalog).
+
+The window only draws tiles and runs these subcommands:
+
+  catalog [--refresh]   print the catalog as JSON, with what is already cached
+  sync                  fetch missing previews and palettes, one JSON line per batch
+  install <url>...      clone themes into ~/.config/omarchy/themes, one JSON line per event
+  remove <slug>         remove a theme that was installed from a git repo
+  menu                  toggle the window
+"""
+
+import concurrent.futures
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlsplit
+
+PLUGIN_ID = "gnome627.theme-picker"
+API = "https://omarchythemes.com/api/themes/all"
+
+HOME = Path.home()
+THEMES = HOME / ".config/omarchy/themes"
+STOCK_THEMES = Path(os.environ.get("OMARCHY_PATH") or "/usr/share/omarchy") / "themes"
+CURRENT_NAME = HOME / ".local/state/omarchy/current/theme.name"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "theme-picker"
+CATALOG_FILE = CACHE / "catalog.json"
+COLORS_FILE = CACHE / "colors.json"
+THUMBS = CACHE / "thumbs"
+CLONES = CACHE / "clones"
+
+CATALOG_TTL = 3600
+# A repo without a readable palette is asked again after this long.
+MISS_TTL = 7 * 24 * 3600
+
+# The same set omarchy-theme-install holds a theme name to.
+SLUG_RE = re.compile(r"^[a-z0-9_][a-z0-9._+-]*$")
+FORGES = {"github.com", "gitlab.com", "codeberg.org", "git.sr.ht", "bitbucket.org"}
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+
+# Swatch order of a tile. The catalog has two colors.toml dialects: named
+# colors (Omarchy's own) and color0..color15.
+SWATCHES = (
+    ("background", None),
+    ("foreground", None),
+    ("accent", None),
+    ("red", "color1"),
+    ("yellow", "color3"),
+    ("green", "color2"),
+    ("cyan", "color6"),
+    ("blue", "color4"),
+    ("magenta", "color5"),
+)
+
+
+def emit(payload):
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def write_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def read_json(path, fallback):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return fallback
+
+
+def fetch(url, limit, timeout=15):
+    request = urllib.request.Request(url, headers={"User-Agent": "omarchy-theme-picker"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("response is too large")
+    return data
+
+
+# ------------------------------------------------------------------ naming
+
+
+def clean_url(url):
+    """The https repo URL without the query a catalog entry sometimes carries."""
+    parts = urlsplit(str(url or "").strip())
+    if parts.scheme != "https" or not parts.netloc:
+        return ""
+    return f"https://{parts.netloc.lower()}{parts.path.rstrip('/')}"
+
+
+def is_repo(url):
+    # Stock themes are listed too, pointing at a manual page instead of a repo.
+    parts = urlsplit(url)
+    return parts.path.count("/") >= 2 and (parts.netloc in FORGES or parts.path.endswith(".git"))
+
+
+def slug_for(url):
+    """The directory omarchy-theme-install would give this repo."""
+    name = url.rstrip("/").rsplit("/", 1)[-1]
+    name = re.sub(r"\.git$", "", name)
+    name = re.sub(r"^omarchy-", "", name)
+    name = re.sub(r"-theme$", "", name)
+    return name.lower()
+
+
+def repo_key(url):
+    """Host and path of a repo, so https and ssh spellings of it compare equal."""
+    url = str(url or "").strip()
+    if "://" in url:
+        parts = urlsplit(url)
+        host, path = parts.hostname or "", parts.path
+    elif ":" in url:
+        host, path = url.split(":", 1)
+        host = host.rsplit("@", 1)[-1]
+    else:
+        return ""
+    path = re.sub(r"\.git$", "", path.strip("/"))
+    return f"{host}/{path}".lower() if host and path else ""
+
+
+def title_for(slug):
+    return re.sub(r"[-_]+", " ", slug).title()
+
+
+# ------------------------------------------------------------------ colors
+
+
+def hex_color(value):
+    value = str(value or "").strip().lower()
+    value = re.sub(r"^0x", "#", value)
+    if re.fullmatch(r"[0-9a-f]{6}", value):
+        value = "#" + value
+    if re.fullmatch(r"#[0-9a-f]{3}", value):
+        value = "#" + "".join(ch * 2 for ch in value[1:])
+    return value[:7] if re.fullmatch(r"#[0-9a-f]{6}([0-9a-f]{2})?", value) else ""
+
+
+def swatches(lookup):
+    colors = []
+    for name, alias in SWATCHES:
+        color = hex_color(lookup(name)) or (hex_color(lookup(alias)) if alias else "")
+        if color:
+            colors.append(color)
+    return colors if len(colors) >= 3 else []
+
+
+def colors_from_theme_toml(text):
+    data = tomllib.loads(text)
+    return swatches(lambda key: data.get(key) if isinstance(data.get(key), str) else "")
+
+
+def colors_from_alacritty(text):
+    colors = tomllib.loads(text).get("colors")
+    if not isinstance(colors, dict):
+        return []
+    primary = colors.get("primary") if isinstance(colors.get("primary"), dict) else {}
+    normal = colors.get("normal") if isinstance(colors.get("normal"), dict) else {}
+
+    def lookup(key):
+        value = primary.get(key) or normal.get(key)
+        return value if isinstance(value, str) else ""
+
+    return swatches(lookup)
+
+
+def colors_from_image(path):
+    """Fallback palette: the dominant colors of the preview, dark to light."""
+    try:
+        result = subprocess.run(
+            ["magick", str(path), "-resize", "96x96", "-colors", "6", "-unique-colors", "txt:-"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    colors = []
+    for found in re.findall(r"#[0-9A-Fa-f]{6}", result.stdout):
+        color = found.lower()
+        if color not in colors:
+            colors.append(color)
+
+    def luminance(color):
+        r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    return sorted(colors, key=luminance)
+
+
+def colors_from_dir(path):
+    for name, parse in (("colors.toml", colors_from_theme_toml), ("alacritty.toml", colors_from_alacritty)):
+        try:
+            colors = parse((path / name).read_text())
+        except (OSError, ValueError):
+            continue
+        if colors:
+            return colors
+    return []
+
+
+def colors_from_repo(url):
+    """Palette read from the repo itself. Raises on a network error, so the
+    caller can tell "no palette" from "could not ask"."""
+    parts = urlsplit(url)
+    if parts.netloc != "github.com":
+        return []
+    repo = re.sub(r"\.git$", "", parts.path.strip("/"))
+    for name, parse in (("colors.toml", colors_from_theme_toml), ("alacritty.toml", colors_from_alacritty)):
+        try:
+            text = fetch(f"https://raw.githubusercontent.com/{repo}/HEAD/{name}", 256 * 1024).decode("utf-8", "replace")
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                continue
+            raise
+        try:
+            colors = parse(text)
+        except ValueError:
+            continue
+        if colors:
+            return colors
+    return []
+
+
+# ------------------------------------------------------------------ catalog
+
+
+def thumb_path(theme_id):
+    return THUMBS / (hashlib.sha1(theme_id.encode()).hexdigest()[:20] + ".jpg")
+
+
+def local_preview(path):
+    for name in ("preview.png", "preview.jpg", "preview.jpeg", "preview.webp"):
+        if (path / name).is_file():
+            return str(path / name)
+    backgrounds = path / "backgrounds"
+    if backgrounds.is_dir():
+        images = sorted(p for p in backgrounds.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES and p.is_file())
+        if images:
+            return str(images[0])
+    return ""
+
+
+def installed_themes():
+    """slug -> repo key of the clone, or "" for a theme that is not a clone."""
+    found = {}
+    if not THEMES.is_dir():
+        return found
+    for path in sorted(THEMES.iterdir()):
+        if not path.is_dir():
+            continue
+        origin = ""
+        if not path.is_symlink() and (path / ".git").is_dir():
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(path), "config", "--get", "remote.origin.url"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                origin = result.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                origin = ""
+            origin = repo_key(origin) or f"local/{path.name}"
+        found[path.name] = origin
+    return found
+
+
+def load_entries(refresh):
+    error = ""
+    try:
+        fresh = time.time() - CATALOG_FILE.stat().st_mtime < CATALOG_TTL
+    except OSError:
+        fresh = False
+    if refresh or not fresh:
+        try:
+            raw = fetch(API, 8 * 1024 * 1024)
+            if not isinstance(json.loads(raw), list):
+                raise ValueError("unexpected catalog format")
+            write_atomic(CATALOG_FILE, raw)
+        except (OSError, ValueError) as failure:
+            error = str(failure)
+    entries = read_json(CATALOG_FILE, [])
+    return (entries if isinstance(entries, list) else []), error
+
+
+def build_themes(refresh=False):
+    entries, error = load_entries(refresh)
+    installed = installed_themes()
+    cached_colors = read_json(COLORS_FILE, {})
+    try:
+        current = CURRENT_NAME.read_text().strip()
+    except OSError:
+        current = ""
+
+    themes = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        url = clean_url(entry.get("url") or entry.get("github_url"))
+        if not url or not is_repo(url):
+            continue
+        slug = slug_for(url)
+        theme_id = repo_key(url)
+        if not SLUG_RE.match(slug) or not theme_id or theme_id in seen:
+            continue
+        seen.add(theme_id)
+
+        preview = str(entry.get("preview_img") or "")
+        if slug not in installed:
+            status = ""
+        elif installed[slug] == theme_id:
+            status = "installed"
+        else:
+            # The directory holds something else: another repo with the same
+            # name, or a theme the user wrote. Not ours to replace or remove.
+            status = "taken"
+
+        thumb = thumb_path(theme_id)
+        colors = cached_colors.get(theme_id, {}).get("colors") or []
+        themes.append({
+            "id": theme_id,
+            "slug": slug,
+            "name": str(entry.get("name") or title_for(slug))[:80],
+            "url": url,
+            "preview": preview if preview.startswith("https://") else "",
+            "thumb": str(thumb) if thumb.is_file() else "",
+            "colors": colors,
+            "status": status,
+            "current": status == "installed" and slug == current,
+            "local": False,
+        })
+
+    # Clones the catalog does not list still belong in the window: they are
+    # installed themes, and this is where they get removed.
+    for slug, origin in installed.items():
+        if not origin or origin in seen or not SLUG_RE.match(slug):
+            continue
+        path = THEMES / slug
+        themes.append({
+            "id": origin,
+            "slug": slug,
+            "name": title_for(slug),
+            "url": "",
+            "preview": "",
+            "thumb": local_preview(path),
+            "colors": colors_from_dir(path),
+            "status": "installed",
+            "current": slug == current,
+            "local": True,
+        })
+
+    # The themes Omarchy ships are installed too, just not removable. The catalog
+    # lists some of them without a repo; the copies on disk are the full set.
+    if STOCK_THEMES.is_dir():
+        for path in sorted(STOCK_THEMES.iterdir()):
+            if not path.is_dir() or not SLUG_RE.match(path.name):
+                continue
+            themes.append({
+                "id": f"stock/{path.name}",
+                "slug": path.name,
+                "name": title_for(path.name),
+                "url": "",
+                "preview": "",
+                "thumb": local_preview(path),
+                "colors": colors_from_dir(path),
+                "status": "stock",
+                "current": path.name == current and path.name not in installed,
+                "local": True,
+            })
+
+    themes.sort(key=lambda theme: theme["name"].lower())
+    return themes, error
+
+
+def needs_sync(theme, cached_colors, now):
+    if theme["local"]:
+        return False
+    if theme["preview"] and not theme["thumb"]:
+        return True
+    entry = cached_colors.get(theme["id"])
+    if not entry:
+        return True
+    return not entry.get("colors") and now - entry.get("at", 0) > MISS_TTL
+
+
+def cmd_catalog(args):
+    themes, error = build_themes(refresh="--refresh" in args)
+    cached_colors = read_json(COLORS_FILE, {})
+    now = time.time()
+    pending = sum(1 for theme in themes if needs_sync(theme, cached_colors, now))
+    emit({"themes": themes, "error": error, "pending": pending})
+
+
+# ------------------------------------------------------------------ sync
+
+
+def sync_one(theme):
+    """Returns (id, thumb path or "", colors, settled). `settled` is False when
+    the network failed, so the answer must not be cached as "no palette"."""
+    thumb = thumb_path(theme["id"])
+    settled = True
+
+    if theme["preview"] and not thumb.is_file():
+        try:
+            data = fetch(theme["preview"], 4 * 1024 * 1024)
+            if data[:2] == b"\xff\xd8" or data[:8] == b"\x89PNG\r\n\x1a\n":
+                write_atomic(thumb, data)
+        except (OSError, ValueError):
+            settled = False
+
+    colors = []
+    try:
+        colors = colors_from_repo(theme["url"])
+    except (OSError, ValueError):
+        settled = False
+    if not colors and thumb.is_file():
+        colors = colors_from_image(thumb)
+
+    return theme["id"], str(thumb) if thumb.is_file() else "", colors, settled
+
+
+def cmd_sync(args):
+    themes, _ = build_themes()
+    cached_colors = read_json(COLORS_FILE, {})
+    now = time.time()
+    todo = [theme for theme in themes if needs_sync(theme, cached_colors, now)]
+
+    batch = {"colors": {}, "thumbs": {}}
+    flushed = time.monotonic()
+
+    def flush():
+        nonlocal batch, flushed
+        if batch["colors"] or batch["thumbs"]:
+            emit(batch)
+            write_atomic(COLORS_FILE, json.dumps(cached_colors).encode())
+        batch = {"colors": {}, "thumbs": {}}
+        flushed = time.monotonic()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        for future in concurrent.futures.as_completed([pool.submit(sync_one, theme) for theme in todo]):
+            try:
+                theme_id, thumb, colors, settled = future.result()
+            except Exception:
+                continue
+            if thumb:
+                batch["thumbs"][theme_id] = thumb
+            if colors:
+                batch["colors"][theme_id] = colors
+            if colors or settled:
+                cached_colors[theme_id] = {"colors": colors, "at": int(now)}
+            if time.monotonic() - flushed > 0.4:
+                flush()
+    flush()
+    emit({"done": True})
+
+
+# ------------------------------------------------------------------ install / remove
+
+
+def last_line(text):
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    return lines[-1][:200] if lines else ""
+
+
+def install_one(url):
+    """Clone one theme. Unlike `omarchy theme install` this does not apply the
+    theme: installing five themes should not switch the desktop five times.
+    The files a cloned theme may not ship are dropped by omarchy-theme-set when
+    the theme is applied, so nothing is lost by cloning alone."""
+    url = clean_url(url)
+    slug = slug_for(url) if url else ""
+    theme_id = repo_key(url)
+    if not url or not SLUG_RE.match(slug):
+        return {"event": "fail", "id": theme_id, "slug": slug, "message": "not a usable theme URL"}
+
+    emit({"event": "start", "id": theme_id, "slug": slug})
+    target = THEMES / slug
+    staging = CLONES / slug
+
+    def fail(message):
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"event": "fail", "id": theme_id, "slug": slug, "message": message}
+
+    if target.exists() or target.is_symlink():
+        return fail("a theme with this name is already installed")
+
+    try:
+        check = subprocess.run(["omarchy-git-url-check", url], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as failure:
+        return fail(f"could not check the URL: {failure}")
+    if check.returncode != 0:
+        return fail(last_line(check.stderr) or "the URL was refused")
+
+    shutil.rmtree(staging, ignore_errors=True)
+    CLONES.mkdir(parents=True, exist_ok=True)
+    # Never let git stop to ask for credentials: a missing repo should fail.
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="/bin/true")
+    try:
+        clone = subprocess.run(
+            ["git", "clone", "--quiet", "--", url, str(staging)],
+            capture_output=True, text=True, timeout=600, env=env, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return fail("the clone timed out")
+    except OSError as failure:
+        return fail(str(failure))
+    if clone.returncode != 0:
+        return fail(last_line(clone.stderr) or "git clone failed")
+
+    THEMES.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        return fail("a theme with this name is already installed")
+    try:
+        shutil.move(str(staging), str(target))
+    except OSError as failure:
+        return fail(str(failure))
+    return {"event": "ok", "id": theme_id, "slug": slug}
+
+
+def cmd_install(args):
+    urls = []
+    slugs = set()
+    for url in args:
+        slug = slug_for(clean_url(url))
+        if slug in slugs:
+            # Two picked themes that would land in the same directory.
+            emit({"event": "fail", "id": repo_key(clean_url(url)), "slug": slug,
+                  "message": "another picked theme has the same name"})
+            continue
+        slugs.add(slug)
+        urls.append(url)
+
+    failed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        for future in concurrent.futures.as_completed([pool.submit(install_one, url) for url in urls]):
+            result = future.result()
+            failed += result["event"] != "ok"
+            emit(result)
+    emit({"event": "done"})
+    return 1 if failed else 0
+
+
+def cmd_remove(args):
+    slug = args[0] if args else ""
+    path = THEMES / slug
+    if not SLUG_RE.match(slug) or not path.is_dir():
+        emit({"event": "fail", "slug": slug, "message": "no such theme"})
+        return 1
+    # Only clones go: a theme written by hand has no copy to install again.
+    if path.is_symlink() or not (path / ".git").is_dir():
+        emit({"event": "fail", "slug": slug, "message": "not installed from a git repo"})
+        return 1
+    try:
+        result = subprocess.run(["omarchy-theme-remove", slug], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as failure:
+        emit({"event": "fail", "slug": slug, "message": str(failure)})
+        return 1
+    if result.returncode != 0 or path.exists():
+        emit({"event": "fail", "slug": slug, "message": last_line(result.stdout + result.stderr) or "removal failed"})
+        return 1
+    emit({"event": "ok", "slug": slug})
+    return 0
+
+
+def cmd_menu(args):
+    os.execvp("omarchy-shell", ["omarchy-shell", "shell", "toggle", PLUGIN_ID, "{}"])
+
+
+COMMANDS = {
+    "catalog": cmd_catalog,
+    "sync": cmd_sync,
+    "install": cmd_install,
+    "remove": cmd_remove,
+    "menu": cmd_menu,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        sys.stderr.write(__doc__)
+        return 2
+    return COMMANDS[sys.argv[1]](sys.argv[2:]) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

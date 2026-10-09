@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "gnome627.theme-picker",
+  "name": "Theme picker",
+  "version": "1.0.0",
+  "author": "gnome627",
+  "description": "Community theme catalog: tiles with preview and palette, pick several and install, remove the highlighted one",
+  "kinds": [
+    "overlay"
+  ],
+  "entryPoints": {
+    "overlay": "ThemePicker.qml"
+  }
+}
