@@ -9,7 +9,7 @@
 ## Установка
 
 ```sh
-git clone https://github.com/Gnome627/theme-picker-omarchy.git
+git clone https://github.com/Baklatech/theme-picker-omarchy.git
 cd theme-picker-omarchy
 ./install.sh
 ```
